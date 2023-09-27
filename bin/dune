@@ -1,4 +1,12 @@
 (executable
  (public_name tribble)
  (name main)
- (libraries tribble eio eio_main cohttp cohttp-eio lambdasoup))
+ (libraries
+  ca-certs
+  piaf
+  eio
+  eio_main
+  lambdasoup
+  mirage-crypto-rng-eio
+  tls-eio
+  tribble))

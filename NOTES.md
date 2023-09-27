@@ -2,9 +2,14 @@
 root url
 -> fetch / extract links from here
 -> collection urls
+-> queue all of those
 
-domains
-domainslib <- higher level lib, Task (threadpool)
+1. Domain
+2. Domainslib <- higher level lib, Task (threadpool)
+3. Lwt + Domains = </3 <- lwt_domains
+   a) run Lwt promises on a main thread from a domain
+   b) turn domain executing code into an Lwt promise
+4. Eio + Cohttp(_eio) 
 
 
 setup a pool of domains
