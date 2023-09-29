@@ -6,6 +6,7 @@
   piaf
   eio
   eio_main
+  domainslib
   lambdasoup
   mirage-crypto-rng-eio
   tls-eio

@@ -1,100 +1,104 @@
 open Eio.Std
 
-type task = Fetch of Uri.t
+module Scheduler = struct
 
-let ( let* ) = Result.bind
+  type t = {
+    domains: unit Domain.t list;
+  }
 
-module Visited_urls = struct
-  type t = { lock : Eio.Mutex.t; urls : (string, unit) Hashtbl.t }
+  let empty: t = { domains = [] }
 
-  let _visited_urls : t =
-    { lock = Eio.Mutex.create (); urls = Hashtbl.create 1024 }
+  let __scheduler__ = ref empty
 
-  let is_visited (Fetch url) =
-    Eio.traceln "Visited_urls.is_visited";
-    Eio.Mutex.use_ro _visited_urls.lock (fun () ->
-        Hashtbl.mem _visited_urls.urls (Uri.to_string url))
+  let run_scheduler () = ()
 
-  let track (Fetch url) =
-    Eio.traceln "Visited_urls.track";
-    Eio.Mutex.use_rw ~protect:true _visited_urls.lock (fun () ->
-        Hashtbl.add _visited_urls.urls (Uri.to_string url) ())
+  let init () = 
+    let nproc = Domain.recommended_domain_count () in
+    let domains = List.init nproc (fun i -> Domain.spawn (fun () -> run_scheduler ())) in
+    __scheduler__ := { domains }
+
 end
 
-let queue_task queue task =
-  if Visited_urls.is_visited task then ()
-  else Eio.Stream.add queue task
 
-module Worker = struct
-  let config = Piaf.Config.{ default with follow_redirects = true }
+module Supervisor (B: Base) = struct
+  type strategy =
+    | One_for_all
+    | One_for_one
 
-  let fetch ~env (Fetch uri) =
-    Printf.printf "fetching %s\n%!" (Uri.to_string uri);
-    Switch.run @@ fun sw ->
-    match Piaf.Client.Oneshot.get ~config env ~sw uri with
-    | Error e -> failwith (Piaf.Error.to_string e)
-    | Ok response when Piaf.Status.is_successful response.status ->
-        Eio.traceln "<- response success";
-        Piaf.Body.to_string response.body
-    | Ok _response -> failwith "bad response"
+  type 'child t = {
+    pids: 'child list;
+    strategy: strategy;
+  }
 
-  module Uri_set = Set.Make (Uri)
-
-  let extract_links body (Fetch uri) =
-    Printf.printf "extractingl inks %s\n%!" (Uri.to_string uri);
-    let host = Uri.host uri |> Option.get in
-    let open Soup in
-    let links = parse body $$ "a" in
-    links
-    |> fold
-         (fun acc link ->
-           match attribute "href" link with
-           | None -> acc
-           | Some href ->
-               let href = Uri.of_string href in
-               let href_host = Uri.host_with_default ~default:host href in
-               if href_host <> host then acc
-               else
-                 let href = Uri.with_host href (Some href_host) in
-                 let href = Uri.with_scheme href (Uri.scheme uri) in
-                 Uri_set.add href acc)
-         Uri_set.empty
-    |> Uri_set.to_list
-
-  let handle_task ~env ~task_queue task =
-    let* body = fetch ~env task in
-    let links = extract_links body task in
-    Printf.printf "found %d links\n%!" (List.length links);
-    Visited_urls.track task;
-    List.iter (fun link -> queue_task task_queue (Fetch link)) links;
-    Eio.traceln "queued tasks";
-    Ok ()
-
-  let rec loop ~env task_queue =
-    Eio.traceln "loop";
-    let task = Eio.Stream.take task_queue in
-    let _result = handle_task ~env ~task_queue task |> Result.get_ok in
-    Eio.traceln "resolve";
-    loop ~env task_queue
-
-  let spawn ~env ~domain ~sw ~task_queue =
-    Fiber.fork_daemon ~sw (fun () ->
-        Eio.Domain_manager.run domain (fun () -> loop ~env task_queue))
+  let make strategy = { pids=[]; strategy }
 end
+
+1. processes on miou -> across cores
+2. messaging
+3. monitor/linking
+4. supervisor
+
+root process
+-> application supervisor
+   -> database supervisors
+      -> database connection pool supervisor
+         -> database connection process
+      -> database query handler supervisor
+         -> database query process
+
+----
+scheduler
+-> threads
+  -> many processes
+
+module Process = struct
+  type 'msg t = { mailbox : 'msg Eio.Stream.t; is_alive : bool ref }
+
+  let recv t () =
+    Eio.Stream.take_nonblocking t.mailbox
+
+  let send t msg = Eio.Stream.add t.mailbox msg
+
+  let _is_alive t = !t.is_alive
+
+  let spawn sw domain fn =
+    let process = { mailbox = Eio.Stream.create max_int ; is_alive = ref true} in
+    Fiber.fork ~sw (fun () ->
+        Fiber.yield ();
+        Eio.Domain_manager.run domain (fun () ->
+            Fiber.yield ();
+            fn ~recv:(recv process);
+            process.is_alive := false;
+            ));
+    process
+end
+
+let rec loop ~recv env name count () =
+  match recv () with
+  | Some 2112 -> Eio.traceln "proc[%s]: dead at %d%!" name count
+  | _ -> loop ~recv env name (count + 1) ()
 
 let main ~env ~domain =
   Switch.run @@ fun sw ->
-  let task_queue = Eio.Stream.create 0 in
-  for _i = 0 to 10 do
-    Worker.spawn ~env ~domain ~sw ~task_queue
-  done;
-  queue_task task_queue (Fetch (Uri.of_string "https://ocaml.org"));
-  let clock = Eio.Stdenv.clock env in
-  Eio.Time.sleep clock 100.0;
+  Eio.traceln "\n";
+  let pids =
+    List.init 1_000_000 (fun i ->
+        Process.spawn sw domain @@ fun ~recv ->
+        loop ~recv env ("pid" ^ string_of_int i) 0 ())
+  in
+  Eio.traceln "spawned 1_000_000 processes";
+
+  Process.send (List.nth pids (Random.int 230)) `kill;
+  Process.send (List.nth pids (Random.int 230)) `kill;
+  Process.send (List.nth pids (Random.int 230)) `kill;
+  Process.send (List.nth pids (Random.int 230)) `kill;
+  Process.send (List.nth pids (Random.int 230)) `kill;
+  Process.send (List.nth pids (Random.int 230)) `kill;
   ()
 
 let () =
   Eio_main.run @@ fun env ->
   Mirage_crypto_rng_eio.run (module Mirage_crypto_rng.Fortuna) env @@ fun () ->
   let domain = Eio.Stdenv.domain_mgr env in
+  Scheduler.init ();
   main ~env ~domain
